@@ -67,28 +67,28 @@ func Execute(ctx context.Context, clientset *kubernetes.Clientset) error {
 	}
 
 	// 查找pod的控制器
-	var controllerName string
-	var controllerType string
+	var controllerName, controllerType, controllerAPIVersion string
 	for _, ref := range pod.OwnerReferences {
-		if ref.Kind == "ReplicaSet" {
-			rs, err := clientset.AppsV1().ReplicaSets(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
-			if err != nil {
-				continue
-			}
-			for _, rsRef := range rs.OwnerReferences {
-				if rsRef.Kind == "Deployment" {
-					controllerName = rsRef.Name
-					controllerType = "Deployment"
-					break
-				}
-			}
-		} else if ref.Kind == "StatefulSet" {
-			controllerName = ref.Name
-			controllerType = "StatefulSet"
-		} else if ref.Kind == "DaemonSet" {
-			controllerName = ref.Name
-			controllerType = "DaemonSet"
+		controllerName = ref.Name
+		controllerType = ref.Kind
+		controllerAPIVersion = ref.APIVersion
+		break // 只取第一个 owner
+	}
+
+	// 判断是否为原生资源
+	isNative := false
+	switch controllerType {
+	case "StatefulSet", "Deployment", "DaemonSet":
+		if controllerAPIVersion == "apps/v1" {
+			isNative = true
 		}
+	case "Job", "CronJob":
+		if controllerAPIVersion == "batch/v1" {
+			isNative = true
+		}
+	}
+	if !isNative {
+		controllerType = "CRD"
 	}
 
 	fmt.Printf("Found controller: %s (%s)\n", controllerName, controllerType)
@@ -99,32 +99,60 @@ func Execute(ctx context.Context, clientset *kubernetes.Clientset) error {
 		var labelSelector string
 		if controllerType == "StatefulSet" {
 			labelSelector = fmt.Sprintf("statefulset.kubernetes.io/pod-name=%s", podName)
-		} else {
+		} else if controllerType == "Job" {
+			labelSelector = fmt.Sprintf("job-name=%s", controllerName)
+		} else if controllerType == "CronJob" {
+			labelSelector = fmt.Sprintf("cronjob-name=%s", controllerName)
+		} else if controllerType == "Deployment" || controllerType == "DaemonSet" {
 			labelSelector = fmt.Sprintf("app=%s", controllerName)
+		} else if controllerType == "CRD" {
+			// 其它自定义资源，优先用常见label查找同组pod
+			podObj, _ := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+			found := false
+			for _, key := range []string{"app", "name", "component"} {
+				if v, ok := podObj.Labels[key]; ok {
+					labelSelector := fmt.Sprintf("%s=%s", key, v)
+					podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+						LabelSelector: labelSelector,
+					})
+					if err == nil && len(podList.Items) > 0 {
+						for _, p := range podList.Items {
+							pods = append(pods, p.Name)
+						}
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				pods = []string{podName}
+			}
 		}
-		podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-			LabelSelector: labelSelector,
-		})
-		if err != nil {
-			return fmt.Errorf("error listing pods: %v", err)
-		}
-		if len(podList.Items) == 0 {
-			// 如果找不到pod，尝试从当前命名空间重新获取pod列表
-			podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		if labelSelector != "" && len(pods) == 0 {
+			podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+				LabelSelector: labelSelector,
+			})
 			if err != nil {
 				return fmt.Errorf("error listing pods: %v", err)
 			}
 			if len(podList.Items) == 0 {
-				return fmt.Errorf("no pods found in namespace %s", namespace)
+				// 如果找不到pod，尝试从当前命名空间重新获取pod列表
+				podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("error listing pods: %v", err)
+				}
+				if len(podList.Items) == 0 {
+					return fmt.Errorf("no pods found in namespace %s", namespace)
+				}
+				fmt.Printf("No pods found for controller %s. Available pods:\n", controllerName)
+				for _, p := range podList.Items {
+					fmt.Printf("- %s\n", p.Name)
+				}
+				return fmt.Errorf("please select a valid pod from the list above")
 			}
-			fmt.Printf("No pods found for controller %s. Available pods:\n", controllerName)
 			for _, p := range podList.Items {
-				fmt.Printf("- %s\n", p.Name)
+				pods = append(pods, p.Name)
 			}
-			return fmt.Errorf("please select a valid pod from the list above")
-		}
-		for _, p := range podList.Items {
-			pods = append(pods, p.Name)
 		}
 	} else {
 		pods = []string{podName}
