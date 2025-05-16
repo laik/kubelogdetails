@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 var (
@@ -31,7 +32,17 @@ var rootCmd = &cobra.Command{
 }
 
 func Execute(ctx context.Context, clientset *kubernetes.Clientset) error {
-	rootCmd.Flags().StringVarP(&namespace, "namespace", "n", "default", "namespace to use")
+	// 从kubeconfig配置中读取默认namespace
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	configOverrides := &clientcmd.ConfigOverrides{}
+	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+	ns, _, err := kubeConfig.Namespace()
+	if err != nil {
+		return fmt.Errorf("error getting namespace from kubeconfig: %v", err)
+	}
+	namespace = ns
+
+	rootCmd.Flags().StringVarP(&namespace, "namespace", "n", namespace, "namespace to use")
 
 	if err := rootCmd.Execute(); err != nil {
 		return err
@@ -40,7 +51,19 @@ func Execute(ctx context.Context, clientset *kubernetes.Clientset) error {
 	// 获取pod信息
 	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("error getting pod: %v", err)
+		// 如果找不到pod，尝试从当前命名空间重新获取pod列表
+		podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return fmt.Errorf("error listing pods: %v", err)
+		}
+		if len(podList.Items) == 0 {
+			return fmt.Errorf("no pods found in namespace %s", namespace)
+		}
+		fmt.Printf("Pod %s not found in namespace %s. Available pods:\n", podName, namespace)
+		for _, p := range podList.Items {
+			fmt.Printf("- %s\n", p.Name)
+		}
+		return fmt.Errorf("please select a valid pod from the list above")
 	}
 
 	// 查找pod的控制器
@@ -73,12 +96,32 @@ func Execute(ctx context.Context, clientset *kubernetes.Clientset) error {
 	// 获取所有相关的pod
 	var pods []string
 	if controllerName != "" {
-		labelSelector := fmt.Sprintf("app=%s", controllerName)
+		var labelSelector string
+		if controllerType == "StatefulSet" {
+			labelSelector = fmt.Sprintf("statefulset.kubernetes.io/pod-name=%s", podName)
+		} else {
+			labelSelector = fmt.Sprintf("app=%s", controllerName)
+		}
 		podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 			LabelSelector: labelSelector,
 		})
 		if err != nil {
 			return fmt.Errorf("error listing pods: %v", err)
+		}
+		if len(podList.Items) == 0 {
+			// 如果找不到pod，尝试从当前命名空间重新获取pod列表
+			podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return fmt.Errorf("error listing pods: %v", err)
+			}
+			if len(podList.Items) == 0 {
+				return fmt.Errorf("no pods found in namespace %s", namespace)
+			}
+			fmt.Printf("No pods found for controller %s. Available pods:\n", controllerName)
+			for _, p := range podList.Items {
+				fmt.Printf("- %s\n", p.Name)
+			}
+			return fmt.Errorf("please select a valid pod from the list above")
 		}
 		for _, p := range podList.Items {
 			pods = append(pods, p.Name)
@@ -156,19 +199,29 @@ func Execute(ctx context.Context, clientset *kubernetes.Clientset) error {
 			defer stream.Close()
 
 			buf := make([]byte, 1024)
+			var logContent strings.Builder
 			for {
 				n, err := stream.Read(buf)
 				if err != nil {
 					break
 				}
-				// 将日志内容按行分割，并确保每行在窗口内自动换行
-				lines := strings.Split(string(buf[:n]), "\n")
+				// 将新日志追加到已有日志末尾，并确保每行自动换行
+				newLog := string(buf[:n])
+				lines := strings.Split(newLog, "\n")
 				for i, line := range lines {
 					if i > 0 {
-						lines[i] = "\n" + line
+						logContent.WriteString("\n")
 					}
+					logContent.WriteString(line)
 				}
-				logWidgets[index].Text = strings.Join(lines, "")
+				// 限制最大行数，避免日志过多导致翻滚过快
+				allLines := strings.Split(logContent.String(), "\n")
+				if len(allLines) > 1000 {
+					allLines = allLines[len(allLines)-1000:]
+					logContent.Reset()
+					logContent.WriteString(strings.Join(allLines, "\n"))
+				}
+				logWidgets[index].Text = logContent.String()
 				termui.Render(grid)
 			}
 		}(i, pod)
