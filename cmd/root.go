@@ -103,15 +103,42 @@ func Execute(ctx context.Context, clientset *kubernetes.Clientset) error {
 			labelSelector = fmt.Sprintf("job-name=%s", controllerName)
 		} else if controllerType == "CronJob" {
 			labelSelector = fmt.Sprintf("cronjob-name=%s", controllerName)
-		} else if controllerType == "Deployment" || controllerType == "DaemonSet" {
+		} else if controllerType == "Deployment" {
 			labelSelector = fmt.Sprintf("app=%s", controllerName)
+		} else if controllerType == "DaemonSet" {
+			// Try both name and k8s-app labels for DaemonSets
+			labelSelectors := []string{
+				fmt.Sprintf("name=%s", controllerName),
+				fmt.Sprintf("k8s-app=%s", controllerName),
+			}
+
+			foundPods := false
+			for _, selector := range labelSelectors {
+				fmt.Printf("Trying label selector: %s in namespace: %s\n", selector, namespace)
+				podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+					LabelSelector: selector,
+				})
+				if err != nil {
+					continue
+				}
+				if len(podList.Items) > 0 {
+					for _, p := range podList.Items {
+						pods = append(pods, p.Name)
+					}
+					foundPods = true
+					break
+				}
+			}
+			if !foundPods {
+				labelSelector = "" // Clear the label selector to trigger the default pod listing
+			}
 		} else if controllerType == "CRD" {
 			// 其它自定义资源，优先用常见label查找同组pod
 			podObj, _ := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 			found := false
 			for _, key := range []string{"app", "name", "component"} {
 				if v, ok := podObj.Labels[key]; ok {
-					labelSelector := fmt.Sprintf("%s=%s", key, v)
+					labelSelector = fmt.Sprintf("%s=%s", key, v)
 					podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 						LabelSelector: labelSelector,
 					})
@@ -129,6 +156,7 @@ func Execute(ctx context.Context, clientset *kubernetes.Clientset) error {
 			}
 		}
 		if labelSelector != "" && len(pods) == 0 {
+			fmt.Printf("Searching for pods with label selector: %s in namespace: %s\n", labelSelector, namespace)
 			podList, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 				LabelSelector: labelSelector,
 			})
